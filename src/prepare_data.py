@@ -1,100 +1,106 @@
-# %% [markdown]
-# # HVAC fault classification - data preparation
-# Goal: predict the fault class (fault_free / damper_stuck / sensor_bias)
-# from sensor readings. Each row is one minute of readings.
+"""
+prepare_data.py - shared data preparation for the HVAC fault classifier.
 
-# %% Step 1: Import libraries
+Both teammates import this file so they train on exactly the same data.
+
+    from prepare_data import load_split
+    X_train, y_train, X_test, y_test, meta_train, meta_test = load_split()
+
+Run it directly to check the sizes:  python src/prepare_data.py
+"""
+import sys
+
 import pandas as pd
 
-# %% Step 2: Load the data
-df = pd.read_csv("data/new_datasets_april_combined.csv", parse_dates=["Datetime"])
+# ---------------------------------------------------------------- settings --
+SEED = 42                      # use this random seed in every model
+DATA_FILE = "data/may_combined.csv"   # run scripts from the repo's main folder
 
-print(df.shape)
-df.head()
+# Time-block split (same dates for every scenario). Last week of May is test;
+# the day before it is dropped as a gap so neighbouring minutes don't leak.
+TEST_START = pd.Timestamp("2018-05-25 00:00")   # test = May 25-31
+GAP_START = pd.Timestamp("2018-05-24 00:00")    # May 24 dropped as a gap
 
-# %% Step 3: Look at the scenarios we have
-print(df.groupby(["fault_type", "fault_level"]).size())
+ROLL_WINDOWS = [15, 60]        # minutes
 
-# %% Step 4: Keep only ONE sensor-bias scenario
-# The four oa_bias files were identical, so we keep +4 and drop the rest.
-# (Mention this as a limitation in the report.)
-df = df[(df["fault_type"] != "oa_bias") | (df["fault_level"] == 4.0)]
-df = df.reset_index(drop=True)
+# The 5 signals from the proposal, plus supply-air temperature (where the
+# coi_bias fault shows up most), plus the occupancy flag.
+# SA_TEMPSPT is constant (55.18 F) so it is not a feature, only used in sa_resid.
+BASE_SIGNALS = ["OA_TEMP", "MA_TEMP", "RA_TEMP", "OA_DMPR_DM", "OA_DMPR", "SA_TEMP"]
+OCCUPANCY = "SYS_CTL"          # 1 = occupied, 0 = unoccupied
 
-print(df.groupby(["fault_type", "fault_level"]).size())
-
-# %% Step 5: Create the target (y) column called "label"
-label_names = {
+LABEL_MAP = {                  # fault_type in the combined file -> class label
     "normal": "fault_free",
     "damper_stuck": "damper_stuck",
-    "oa_bias": "sensor_bias",
+    "coi_bias": "sensor_bias",    
 }
-df["label"] = df["fault_type"].map(label_names)
 
-# a name for each scenario (used later for reports and rolling features)
-df["scenario"] = df["fault_type"] + "_" + df["fault_level"].astype(str)
 
-# sort so that the rows of each scenario are in time order
-df = df.sort_values(["scenario", "Datetime"]).reset_index(drop=True)
+# ------------------------------------------------------------------ loading --
+def load_raw(path=DATA_FILE) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["Datetime"])
 
-print(df["label"].value_counts())
+    df["label"] = df["fault_type"].map(LABEL_MAP)
+    df["scenario"] = df["fault_type"] + "_" + df["fault_level"].astype(str)
+    return df.sort_values(["scenario", "Datetime"]).reset_index(drop=True)
 
-# %% Step 6: Feature engineering - two difference features
-# 1) damper position minus damper command (big gap when the damper is stuck)
-df["damper_resid"] = df["OA_DMPR"] - df["OA_DMPR_DM"]
 
-# 2) measured mixed-air temp minus the temp we would expect from the damper
-#    position (approximation: damper position = outdoor-air fraction)
-expected_ma = df["RA_TEMP"] + df["OA_DMPR"] * (df["OA_TEMP"] - df["RA_TEMP"])
-df["ma_resid"] = df["MA_TEMP"] - expected_ma
+# ----------------------------------------------------------------- features --
+def add_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-# %% Step 7: Feature engineering - rolling mean and std over the last 15 and 60 minutes
-# We do this inside each scenario so a window never mixes two scenarios.
-cols_to_roll = ["damper_resid", "ma_resid", "MA_TEMP", "OA_DMPR"]
+    # Damper command vs. actual position (large when the damper is stuck).
+    df["damper_resid"] = df["OA_DMPR"] - df["OA_DMPR_DM"]
 
-for window in [15, 60]:
-    for col in cols_to_roll:
-        by_scenario = df.groupby("scenario")[col]
-        df[f"{col}_mean{window}"] = by_scenario.transform(lambda s: s.rolling(window).mean())
-        df[f"{col}_std{window}"] = by_scenario.transform(lambda s: s.rolling(window).std())
+    # Measured mixed-air temp vs. what the damper position predicts.
+    # (Approximation: damper position treated as the outdoor-air fraction.)
+    expected_ma = df["RA_TEMP"] + df["OA_DMPR"] * (df["OA_TEMP"] - df["RA_TEMP"])
+    df["ma_resid"] = df["MA_TEMP"] - expected_ma
 
-# %% Step 8: Remove rows with missing values
-# The first rows of every scenario have no full window yet, so they are NaN.
-print("rows before:", len(df))
-df = df.dropna().reset_index(drop=True)
-print("rows after: ", len(df))
+    # Supply-air temp vs. its setpoint (shifted when the SA sensor is biased).
+    df["sa_resid"] = df["SA_TEMP"] - df["SA_TEMPSPT"]
 
-# %% Step 9: Choose the features (X) and the target (y)
-feature_cols = (
-    ["OA_TEMP", "MA_TEMP", "RA_TEMP", "OA_DMPR_DM", "OA_DMPR", "SYS_CTL",
-     "damper_resid", "ma_resid"]
-    + [c for c in df.columns if "_mean" in c or "_std" in c]
-)
+    # Rolling mean / std, computed inside each scenario so windows never
+    # cross from one scenario into the next.
+    roll_cols = ["damper_resid", "ma_resid", "sa_resid", "MA_TEMP", "OA_DMPR"]
+    g = df.groupby("scenario", sort=False)
+    for w in ROLL_WINDOWS:
+        for c in roll_cols:
+            r = g[c].rolling(w, min_periods=w)
+            df[f"{c}_mean{w}"] = r.mean().reset_index(level=0, drop=True)
+            df[f"{c}_std{w}"] = r.std().reset_index(level=0, drop=True)
 
-X = df[feature_cols]
-y = df["label"]
+    # Drop the first rows of each scenario where the windows aren't full.
+    return df.dropna().reset_index(drop=True)
 
-print(len(feature_cols), "features")
-print(feature_cols)
 
-# %% Step 10: Train / test split BY TIME (not random)
-# Rows next to each other (minute by minute) are almost identical, so a random
-# split would put near-copies of the training rows in the test set and give
-# unrealistically good scores. Instead:
-#   train = April 1 - 22, gap = April 23 (dropped), test = April 24 - 30
-train_mask = df["Datetime"] < "2018-04-23"
-test_mask = df["Datetime"] >= "2018-04-24"
+def feature_columns(df: pd.DataFrame) -> list:
+    base = BASE_SIGNALS + [OCCUPANCY, "damper_resid", "ma_resid", "sa_resid"]
+    rolled = [c for c in df.columns if "_mean" in c or "_std" in c]
+    return base + rolled
 
-X_train, y_train = X[train_mask], y[train_mask]
-X_test, y_test = X[test_mask], y[test_mask]
 
-# keep date / scenario / fault level for reports (NOT for training)
-info_train = df.loc[train_mask, ["Datetime", "scenario", "fault_level"]]
-info_test = df.loc[test_mask, ["Datetime", "scenario", "fault_level"]]
+# -------------------------------------------------------------------- split --
+def load_split(path=DATA_FILE):
+    df = add_features(load_raw(path))
+    cols = feature_columns(df)
 
-# %% Step 11: Check the sizes (both teammates should get the same numbers)
-print("X_train:", X_train.shape, " X_test:", X_test.shape)
-print("\nTrain classes:\n", y_train.value_counts())
-print("\nTest classes:\n", y_test.value_counts())
+    train = df[df["Datetime"] < GAP_START]
+    test = df[df["Datetime"] >= TEST_START]
+    meta = ["Datetime", "scenario", "fault_level"]   # for per-scenario reports only
 
-RANDOM_STATE = 42   # use this in every model, e.g. RandomForestClassifier(random_state=42)
+    return (train[cols], train["label"], test[cols], test["label"],
+            train[meta], test[meta])
+
+
+if __name__ == "__main__":
+    path = sys.argv[1] if len(sys.argv) > 1 else DATA_FILE
+    X_tr, y_tr, X_te, y_te, m_tr, m_te = load_split(path)
+    print(f"Features ({X_tr.shape[1]}): {list(X_tr.columns)}\n")
+    print(f"Train: {X_tr.shape[0]} rows  ({m_tr.Datetime.min()} -> {m_tr.Datetime.max()})")
+    print(f"Test:  {X_te.shape[0]} rows  ({m_te.Datetime.min()} -> {m_te.Datetime.max()})\n")
+    print("Train classes:\n", y_tr.value_counts().to_string(), "\n")
+    print("Test classes:\n", y_te.value_counts().to_string(), "\n")
+    print("Rows per scenario (train / test):")
+    print(pd.concat([m_tr.scenario.value_counts().rename("train"),
+                     m_te.scenario.value_counts().rename("test")], axis=1).to_string())
